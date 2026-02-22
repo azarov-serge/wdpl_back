@@ -31,6 +31,16 @@ func Load() (*Config, error) {
 	return &cfg, nil
 }
 
+// MustLoad как Load, но при отсутствии обязательных переменных (env-required) завершает программу через panic.
+// Использовать в main при старте — без валидного конфига приложение не должно работать.
+func MustLoad() *Config {
+	cfg, err := Load()
+	if err != nil {
+		panic(err)
+	}
+	return cfg
+}
+
 func (c *Config) ServerAddress() string {
 	return fmt.Sprintf("%s:%d", c.ServerHost, c.ServerPort)
 }

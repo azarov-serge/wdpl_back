@@ -17,6 +17,10 @@ type Handler struct {
 	validate *validator.Validate
 }
 
+// refreshCookieName — имя HTTP‑only cookie для refresh‑токена.
+// Важно: фронт не имеет доступа к значению, только браузер отправляет его на бекенд.
+const refreshCookieName = "refreshToken"
+
 func NewHandler(service *Service) *Handler {
 	return &Handler{
 		service:  service,
@@ -49,6 +53,8 @@ func (h *Handler) SignUp(c *fiber.Ctx) error {
 		}
 		return response.WriteInternalError(c, err)
 	}
+
+	setRefreshCookie(c, tokens.RefreshToken, tokens.RefreshExpiry)
 
 	return c.JSON(AuthResponse{
 		UserID:       user.ID,
@@ -85,6 +91,8 @@ func (h *Handler) SignIn(c *fiber.Ctx) error {
 		return response.WriteInternalError(c, err)
 	}
 
+	setRefreshCookie(c, tokens.RefreshToken, tokens.RefreshExpiry)
+
 	return c.JSON(AuthResponse{
 		UserID:       user.ID,
 		Email:        user.Email,
@@ -95,16 +103,22 @@ func (h *Handler) SignIn(c *fiber.Ctx) error {
 }
 
 func (h *Handler) Refresh(c *fiber.Ctx) error {
-	type RefreshRequest struct {
-		RefreshToken string `json:"refreshToken" validate:"required"`
-	}
+	// Пытаемся взять refresh‑токен из HTTP‑only cookie.
+	refreshToken := c.Cookies(refreshCookieName)
+	if refreshToken == "" {
+		// Для обратной совместимости поддерживаем вариант с токеном в теле.
+		type RefreshRequest struct {
+			RefreshToken string `json:"refreshToken" validate:"required"`
+		}
 
-	var req RefreshRequest
-	if err := c.BodyParser(&req); err != nil {
-		return response.WriteError(c, fiber.StatusBadRequest, "invalid body")
-	}
-	if err := h.validate.Struct(req); err != nil {
-		return response.WriteError(c, fiber.StatusBadRequest, "validation failed")
+		var req RefreshRequest
+		if err := c.BodyParser(&req); err != nil {
+			return response.WriteError(c, fiber.StatusBadRequest, "invalid body")
+		}
+		if err := h.validate.Struct(req); err != nil {
+			return response.WriteError(c, fiber.StatusBadRequest, "validation failed")
+		}
+		refreshToken = req.RefreshToken
 	}
 
 	ctx, cancel := handler.TimeoutContext(c, 5*time.Second)
@@ -113,13 +127,15 @@ func (h *Handler) Refresh(c *fiber.Ctx) error {
 	userAgent := c.Get("User-Agent")
 	ip := c.IP()
 
-	tokens, err := h.service.Refresh(ctx, req.RefreshToken, userAgent, ip)
+	tokens, err := h.service.Refresh(ctx, refreshToken, userAgent, ip)
 	if err != nil {
 		if errors.Is(err, ErrInvalidCredentials) {
 			return response.WriteError(c, fiber.StatusUnauthorized, "invalid refresh token")
 		}
 		return response.WriteInternalError(c, err)
 	}
+
+	setRefreshCookie(c, tokens.RefreshToken, tokens.RefreshExpiry)
 
 	// Для простого сценария checkAuth фронт может вызывать /refresh и по 200 понимать,
 	// что пользователь авторизован.
@@ -130,23 +146,57 @@ func (h *Handler) Refresh(c *fiber.Ctx) error {
 }
 
 func (h *Handler) SignOut(c *fiber.Ctx) error {
-	type SignOutRequest struct {
-		RefreshToken string `json:"refreshToken" validate:"required"`
-	}
+	// Сначала пробуем взять токен из cookie, чтобы фронт не держал его в JS.
+	refreshToken := c.Cookies(refreshCookieName)
+	if refreshToken == "" {
+		// Для обратной совместимости: можно прислать токен в теле.
+		type SignOutRequest struct {
+			RefreshToken string `json:"refreshToken" validate:"required"`
+		}
 
-	var req SignOutRequest
-	if err := c.BodyParser(&req); err != nil {
-		return response.WriteError(c, fiber.StatusBadRequest, "invalid body")
-	}
-	if err := h.validate.Struct(req); err != nil {
-		return response.WriteError(c, fiber.StatusBadRequest, "validation failed")
+		var req SignOutRequest
+		if err := c.BodyParser(&req); err != nil {
+			return response.WriteError(c, fiber.StatusBadRequest, "invalid body")
+		}
+		if err := h.validate.Struct(req); err != nil {
+			return response.WriteError(c, fiber.StatusBadRequest, "validation failed")
+		}
+		refreshToken = req.RefreshToken
 	}
 
 	ctx, cancel := handler.TimeoutContext(c, 5*time.Second)
 	defer cancel()
 
-	if err := h.service.RevokeByToken(ctx, req.RefreshToken); err != nil {
+	if err := h.service.RevokeByToken(ctx, refreshToken); err != nil {
 		return response.WriteInternalError(c, err)
 	}
+
+	clearRefreshCookie(c)
+
 	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// setRefreshCookie выставляет HTTP‑only cookie с refresh‑токеном.
+// Secure=true подразумевает использование HTTPS в продакшене.
+func setRefreshCookie(c *fiber.Ctx, token string, expiresAt time.Time) {
+	c.Cookie(&fiber.Cookie{
+		Name:     refreshCookieName,
+		Value:    token,
+		Path:     "/",
+		Expires:  expiresAt,
+		HTTPOnly: true,
+		Secure:   true,
+	})
+}
+
+// clearRefreshCookie очищает refresh‑cookie на клиенте.
+func clearRefreshCookie(c *fiber.Ctx) {
+	c.Cookie(&fiber.Cookie{
+		Name:     refreshCookieName,
+		Value:    "",
+		Path:     "/",
+		Expires:  time.Now().Add(-time.Hour),
+		HTTPOnly: true,
+		Secure:   true,
+	})
 }
